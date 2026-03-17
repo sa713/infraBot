@@ -18,6 +18,7 @@ from telegram.ext import (
 class Config:
     bot_token: str
     services: list[str]
+    watchdog_services: set[str]
     allowed_user_ids: set[int]
     alert_chat_ids: list[int]
     check_interval_sec: int
@@ -70,10 +71,17 @@ def _parse_hhmm_time(raw: str) -> time:
 def load_config() -> Config:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     services = _parse_service_list(os.getenv("MONITORED_SERVICES"))
+    watchdog_services = set(_parse_service_list(os.getenv("WATCHDOG_SERVICES")))
 
     vpn_service = os.getenv("VPN_SERVICE", "").strip()
     if vpn_service and vpn_service not in services:
         services.append(vpn_service)
+    if vpn_service and vpn_service in watchdog_services:
+        logging.info("VPN service %s is configured as watchdog service", vpn_service)
+
+    for service in watchdog_services:
+        if service not in services:
+            services.append(service)
 
     allowed_user_ids = set(_parse_int_list(os.getenv("ALLOWED_USER_IDS")))
     alert_chat_ids = _parse_int_list(os.getenv("ALERT_CHAT_IDS"))
@@ -100,6 +108,7 @@ def load_config() -> Config:
     return Config(
         bot_token=bot_token,
         services=services,
+        watchdog_services=watchdog_services,
         allowed_user_ids=allowed_user_ids,
         alert_chat_ids=alert_chat_ids,
         check_interval_sec=check_interval_sec,
@@ -139,6 +148,26 @@ async def run_systemctl(
 
 
 async def get_service_state(cfg: Config, service: str) -> dict[str, str]:
+    if service in cfg.watchdog_services:
+        rc_check, _, err_check = await run_systemctl(cfg, "start", service)
+        rc_enabled, out_enabled, err_enabled = await run_systemctl(
+            cfg, "is-enabled", service
+        )
+        enabled = (
+            out_enabled if out_enabled else (err_enabled if err_enabled else "unknown")
+        )
+        if rc_enabled != 0 and not out_enabled:
+            enabled = "unknown"
+
+        active = "active" if rc_check == 0 else "failed"
+        if rc_check != 0 and err_check:
+            active = f"failed: {err_check}"
+
+        return {
+            "active": active,
+            "enabled": enabled,
+        }
+
     rc_active, out_active, err_active = await run_systemctl(cfg, "is-active", service)
     active = out_active if out_active else (err_active if err_active else "unknown")
     if rc_active != 0 and not out_active:
@@ -158,7 +187,7 @@ async def get_service_state(cfg: Config, service: str) -> dict[str, str]:
 
 
 def is_problem(active_state: str) -> bool:
-    return active_state != "active"
+    return not active_state.startswith("active")
 
 
 def is_authorized(update: Update, cfg: Config) -> bool:
@@ -287,14 +316,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Неизвестная команда.")
         return
 
-    rc, _, err = await run_systemctl(cfg, action, service)
+    effective_action = action
+    if service in cfg.watchdog_services:
+        if action == "restart":
+            # oneshot watchdogs are triggered via "start"
+            effective_action = "start"
+        elif action == "stop":
+            await query.edit_message_text(
+                (
+                    f"Команда stop для {service} не поддерживается.\n"
+                    "Для watchdog-действий используйте Статус или Рестарт."
+                ),
+                reply_markup=build_keyboard(cfg.services),
+            )
+            return
+
+    rc, _, err = await run_systemctl(cfg, effective_action, service)
 
     state = await get_service_state(cfg, service)
     result = "успешно" if rc == 0 else f"ошибка ({err or 'без stderr'})"
 
     await query.edit_message_text(
         (
-            f"Команда {action} для {service}: {result}\n"
+            f"Команда {action} ({effective_action}) для {service}: {result}\n"
             f"active: {state['active']}\n"
             f"enabled: {state['enabled']}"
         ),
