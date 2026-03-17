@@ -128,7 +128,7 @@ async def run_command(*args: str, timeout_sec: int) -> tuple[int, str, str]:
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
-    except TimeoutError:
+    except (asyncio.TimeoutError, TimeoutError):
         proc.kill()
         await proc.wait()
         return (124, "", f"Command timed out after {timeout_sec}s")
