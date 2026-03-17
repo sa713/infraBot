@@ -6,8 +6,10 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, time
+from typing import Any, Awaitable, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -216,12 +218,66 @@ def build_keyboard(services: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+async def with_telegram_retries(
+    action_name: str,
+    action: Callable[[], Awaitable[Any]],
+    retries: int = 2,
+) -> Any | None:
+    for attempt in range(retries + 1):
+        try:
+            return await action()
+        except RetryAfter as exc:
+            delay = float(getattr(exc, "retry_after", 1) or 1)
+            logging.warning(
+                "Telegram API retry-after for %s (attempt %s/%s), waiting %.1fs",
+                action_name,
+                attempt + 1,
+                retries + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError):
+            if attempt >= retries:
+                logging.exception("Telegram API call failed: %s", action_name)
+                return None
+            delay = float(attempt + 1)
+            logging.warning(
+                "Telegram API timeout/network error for %s (attempt %s/%s), retry in %.1fs",
+                action_name,
+                attempt + 1,
+                retries + 1,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    return None
+
+
+async def safe_reply_text(message: Any, text: str, reply_markup: Any | None = None) -> None:
+    await with_telegram_retries(
+        "reply_text",
+        lambda: message.reply_text(text=text, reply_markup=reply_markup),
+    )
+
+
+async def safe_edit_text(query: Any, text: str, reply_markup: Any | None = None) -> None:
+    await with_telegram_retries(
+        "edit_message_text",
+        lambda: query.edit_message_text(text=text, reply_markup=reply_markup),
+    )
+
+
+async def safe_answer_callback(query: Any) -> None:
+    await with_telegram_retries("callback_query.answer", lambda: query.answer())
+
+
 async def broadcast_alert(application: Application, cfg: Config, text: str) -> None:
     for chat_id in cfg.alert_chat_ids:
-        try:
-            await application.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            logging.exception("Failed to send alert to chat_id=%s", chat_id)
+        result = await with_telegram_retries(
+            "send_message",
+            lambda: application.bot.send_message(chat_id=chat_id, text=text),
+        )
+        if result is None:
+            logging.error("Failed to send alert to chat_id=%s", chat_id)
 
 
 async def format_all_status(cfg: Config, header: str = "Текущий статус сервисов:") -> str:
@@ -240,7 +296,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_authorized(update, cfg):
         return
 
-    await update.effective_message.reply_text(
+    await safe_reply_text(
+        update.effective_message,
         "Панель управления сервисами.",
         reply_markup=build_keyboard(cfg.services),
     )
@@ -251,7 +308,7 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_authorized(update, cfg):
         return
 
-    await update.effective_message.reply_text(await format_all_status(cfg))
+    await safe_reply_text(update.effective_message, await format_all_status(cfg))
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -259,7 +316,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_authorized(update, cfg):
         return
 
-    await update.effective_message.reply_text(
+    await safe_reply_text(
+        update.effective_message,
         "Команды:\n"
         "/start - показать кнопки\n"
         "/status - показать статус всех сервисов\n"
@@ -271,51 +329,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cfg: Config = context.application.bot_data["cfg"]
 
     query = update.callback_query
-    await query.answer()
+    await safe_answer_callback(query)
 
     if not is_authorized(update, cfg):
-        await query.edit_message_text("Недостаточно прав для управления.")
+        await safe_edit_text(query, "Недостаточно прав для управления.")
         return
 
     data = query.data or ""
     if data in {"all", "summary_now"}:
-        await query.edit_message_text(
+        await safe_edit_text(
+            query,
             await format_all_status(cfg, header="Сводка по сервисам (по запросу):"),
-            reply_markup=build_keyboard(cfg.services),
+            build_keyboard(cfg.services),
         )
         return
 
     parts = data.split("|")
     if len(parts) != 3 or parts[0] != "s":
-        await query.edit_message_text("Неизвестное действие.")
+        await safe_edit_text(query, "Неизвестное действие.")
         return
 
     idx_raw, action = parts[1], parts[2]
     if not idx_raw.isdigit():
-        await query.edit_message_text("Некорректный индекс сервиса.")
+        await safe_edit_text(query, "Некорректный индекс сервиса.")
         return
 
     idx = int(idx_raw)
     if idx < 0 or idx >= len(cfg.services):
-        await query.edit_message_text("Сервис не найден.")
+        await safe_edit_text(query, "Сервис не найден.")
         return
 
     service = cfg.services[idx]
 
     if action == "status":
         state = await get_service_state(cfg, service)
-        await query.edit_message_text(
+        await safe_edit_text(
+            query,
             (
                 f"{service}\n"
                 f"active: {state['active']}\n"
                 f"enabled: {state['enabled']}"
             ),
-            reply_markup=build_keyboard(cfg.services),
+            build_keyboard(cfg.services),
         )
         return
 
     if action not in {"restart", "stop"}:
-        await query.edit_message_text("Неизвестная команда.")
+        await safe_edit_text(query, "Неизвестная команда.")
         return
 
     effective_action = action
@@ -324,12 +384,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             # oneshot watchdogs are triggered via "start"
             effective_action = "start"
         elif action == "stop":
-            await query.edit_message_text(
+            await safe_edit_text(
+                query,
                 (
                     f"Команда stop для {service} не поддерживается.\n"
                     "Для watchdog-действий используйте Статус или Рестарт."
                 ),
-                reply_markup=build_keyboard(cfg.services),
+                build_keyboard(cfg.services),
             )
             return
 
@@ -338,13 +399,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state = await get_service_state(cfg, service)
     result = "успешно" if rc == 0 else f"ошибка ({err or 'без stderr'})"
 
-    await query.edit_message_text(
+    await safe_edit_text(
+        query,
         (
             f"Команда {action} ({effective_action}) для {service}: {result}\n"
             f"active: {state['active']}\n"
             f"enabled: {state['enabled']}"
         ),
-        reply_markup=build_keyboard(cfg.services),
+        build_keyboard(cfg.services),
     )
 
 
@@ -393,6 +455,13 @@ async def daily_status_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     await broadcast_alert(application, cfg, report)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.error(
+        "Unhandled exception while processing update",
+        exc_info=context.error,
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -408,6 +477,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_error_handler(error_handler)
 
     if app.job_queue is None:
         raise RuntimeError(
