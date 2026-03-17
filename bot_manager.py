@@ -22,6 +22,7 @@ from telegram.ext import (
 class Config:
     bot_token: str
     services: list[str]
+    button_labels: dict[str, str]
     watchdog_services: set[str]
     allowed_user_ids: set[int]
     alert_chat_ids: list[int]
@@ -29,6 +30,14 @@ class Config:
     command_timeout_sec: int
     daily_report_time: time
     use_sudo: bool
+
+
+DEFAULT_BUTTON_LABELS = {
+    "bo2sale.service": "bo2",
+    "random-coffee.service": "redcof",
+    "sberphoto365.service": "sber365",
+    "adguard-vpn-watchdog.service": "vpn",
+}
 
 
 def _parse_int_list(raw: str | None) -> list[int]:
@@ -55,6 +64,23 @@ def _parse_service_list(raw: str | None) -> list[str]:
         seen.add(service)
         deduped.append(service)
     return deduped
+
+
+def _parse_service_label_map(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        service, label = item.split("=", 1)
+        service = service.strip()
+        label = label.strip()
+        if not service or not label:
+            continue
+        result[service] = label
+    return result
 
 
 def _parse_hhmm_time(raw: str) -> time:
@@ -93,6 +119,8 @@ def load_config() -> Config:
     check_interval_sec = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
     command_timeout_sec = int(os.getenv("COMMAND_TIMEOUT_SEC", "15"))
     daily_report_time = _parse_hhmm_time(os.getenv("DAILY_REPORT_TIME", "08:00"))
+    button_labels = dict(DEFAULT_BUTTON_LABELS)
+    button_labels.update(_parse_service_label_map(os.getenv("SERVICE_BUTTON_LABELS")))
     use_sudo = os.getenv("USE_SUDO", "false").strip().lower() in {
         "1",
         "true",
@@ -112,6 +140,7 @@ def load_config() -> Config:
     return Config(
         bot_token=bot_token,
         services=services,
+        button_labels=button_labels,
         watchdog_services=watchdog_services,
         allowed_user_ids=allowed_user_ids,
         alert_chat_ids=alert_chat_ids,
@@ -153,7 +182,7 @@ async def run_systemctl(
 
 async def get_service_state(cfg: Config, service: str) -> dict[str, str]:
     if service in cfg.watchdog_services:
-        rc_check, _, err_check = await run_systemctl(cfg, "start", service)
+        rc_check, _, _ = await run_systemctl(cfg, "start", service)
         rc_enabled, out_enabled, err_enabled = await run_systemctl(
             cfg, "is-enabled", service
         )
@@ -164,8 +193,6 @@ async def get_service_state(cfg: Config, service: str) -> dict[str, str]:
             enabled = "unknown"
 
         active = "active" if rc_check == 0 else "failed"
-        if rc_check != 0 and err_check:
-            active = f"failed: {err_check}"
 
         return {
             "active": active,
@@ -194,6 +221,18 @@ def is_problem(active_state: str) -> bool:
     return not active_state.startswith("active")
 
 
+def short_service_name(service: str) -> str:
+    if service.endswith(".service"):
+        return service[: -len(".service")]
+    return service
+
+
+def alert_state(active_state: str) -> str:
+    if active_state.startswith("failed"):
+        return "failed"
+    return active_state
+
+
 def is_authorized(update: Update, cfg: Config) -> bool:
     user = update.effective_user
     if user is None:
@@ -201,15 +240,19 @@ def is_authorized(update: Update, cfg: Config) -> bool:
     return user.id in cfg.allowed_user_ids
 
 
-def build_keyboard(services: list[str]) -> InlineKeyboardMarkup:
+def service_button_label(cfg: Config, service: str) -> str:
+    return cfg.button_labels.get(service, short_service_name(service))
+
+
+def build_keyboard(cfg: Config) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("Сводка сейчас", callback_data="summary_now")]
     ]
 
-    for idx, service in enumerate(services):
+    for idx, service in enumerate(cfg.services):
         rows.append(
             [
-                InlineKeyboardButton(f"Статус {service}", callback_data=f"s|{idx}|status"),
+                InlineKeyboardButton(service_button_label(cfg, service), callback_data=f"s|{idx}|status"),
                 InlineKeyboardButton("Рестарт", callback_data=f"s|{idx}|restart"),
                 InlineKeyboardButton("Стоп", callback_data=f"s|{idx}|stop"),
             ]
@@ -285,9 +328,7 @@ async def format_all_status(cfg: Config, header: str = "Текущий стат�
     for service in cfg.services:
         state = await get_service_state(cfg, service)
         mark = "OK" if not is_problem(state["active"]) else "PROBLEM"
-        lines.append(
-            f"- {service}: {state['active']} (enabled: {state['enabled']}) [{mark}]"
-        )
+        lines.append(f"- {short_service_name(service)}: {alert_state(state['active'])} [{mark}]")
     return "\n".join(lines)
 
 
@@ -299,7 +340,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_reply_text(
         update.effective_message,
         "Панель управления сервисами.",
-        reply_markup=build_keyboard(cfg.services),
+        reply_markup=build_keyboard(cfg),
     )
 
 
@@ -340,7 +381,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit_text(
             query,
             await format_all_status(cfg, header="Сводка по сервисам (по запросу):"),
-            build_keyboard(cfg.services),
+            build_keyboard(cfg),
         )
         return
 
@@ -370,7 +411,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"active: {state['active']}\n"
                 f"enabled: {state['enabled']}"
             ),
-            build_keyboard(cfg.services),
+            build_keyboard(cfg),
         )
         return
 
@@ -390,7 +431,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     f"Команда stop для {service} не поддерживается.\n"
                     "Для watchdog-действий используйте Статус или Рестарт."
                 ),
-                build_keyboard(cfg.services),
+                build_keyboard(cfg),
             )
             return
 
@@ -406,7 +447,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"active: {state['active']}\n"
             f"enabled: {state['enabled']}"
         ),
-        build_keyboard(cfg.services),
+        build_keyboard(cfg),
     )
 
 
@@ -417,9 +458,10 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for service in cfg.services:
         state = await get_service_state(cfg, service)
-        current = state["active"]
+        current = alert_state(state["active"])
         previous = last_states.get(service)
         last_states[service] = current
+        service_name = short_service_name(service)
 
         # First observation: alert only if service is already unhealthy.
         if previous is None:
@@ -427,7 +469,7 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await broadcast_alert(
                     application,
                     cfg,
-                    f"ALERT: {service} has unhealthy state: {current}",
+                    f"ALERT: {service_name} has unhealthy state: {current}",
                 )
             continue
 
@@ -438,13 +480,13 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             await broadcast_alert(
                 application,
                 cfg,
-                f"ALERT: {service} changed {previous} -> {current}",
+                f"ALERT: {service_name} changed {previous} -> {current}",
             )
         else:
             await broadcast_alert(
                 application,
                 cfg,
-                f"RECOVERY: {service} changed {previous} -> {current}",
+                f"RECOVERY: {service_name} changed {previous} -> {current}",
             )
 
 

@@ -45,6 +45,7 @@ cp .env.example .env
 - `ALLOWED_USER_IDS` — ваш Telegram user id
 - `MONITORED_SERVICES` — сервисы ваших ботов
 - `WATCHDOG_SERVICES` — `oneshot` watchdog-сервисы (опционально)
+- `SERVICE_BUTTON_LABELS` — короткие подписи кнопок (`service=label` через запятую)
 - `VPN_SERVICE` — сервис VPN (например `wg-quick@wg0.service`)
 - `DAILY_REPORT_TIME` — время ежедневной сводки, по локальному времени сервера (по умолчанию `08:00`)
 
