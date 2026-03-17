@@ -199,7 +199,7 @@ def is_authorized(update: Update, cfg: Config) -> bool:
 
 def build_keyboard(services: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("Общий статус", callback_data="all")]
+        [InlineKeyboardButton("Сводка сейчас", callback_data="summary_now")]
     ]
 
     for idx, service in enumerate(services):
@@ -276,9 +276,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data or ""
-    if data == "all":
+    if data in {"all", "summary_now"}:
         await query.edit_message_text(
-            await format_all_status(cfg),
+            await format_all_status(cfg, header="Сводка по сервисам (по запросу):"),
             reply_markup=build_keyboard(cfg.services),
         )
         return
